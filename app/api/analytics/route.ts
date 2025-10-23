@@ -65,7 +65,7 @@ export async function GET(): Promise<Response> {
     // Fetch data from Whop API with retry logic
     const [membershipsResponse, paymentsResponse, productsResponse, plansResponse] = await Promise.all([
       retryWithBackoff(() => whopsdk.memberships.list({ company_id: companyId, first: 1000 })),
-      retryWithBackoff(() => whopsdk.payments.list({ company_id: companyId, first: 1000 })),
+      retryWithBackoff(() => whopsdk.payments.list({ first: 1000 })),
       retryWithBackoff(() => whopsdk.products.list({ company_id: companyId, first: 100 })),
       retryWithBackoff(() => whopsdk.plans.list({ company_id: companyId, first: 1000 })),
     ]);
