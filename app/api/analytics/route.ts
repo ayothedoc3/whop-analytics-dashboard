@@ -1,4 +1,4 @@
-import { whopSdk } from "@/lib/whop-sdk";
+import { whopsdk } from "@/lib/whop-sdk";
 import { NextResponse } from "next/server";
 
 // Helper function to calculate date ranges
@@ -35,14 +35,14 @@ export async function GET(): Promise<Response> {
   try {
     // Fetch data from Whop API with retry logic
     const [subscriptionsResponse, paymentsResponse, productsResponse] = await Promise.all([
-      retryWithBackoff(() => whopSdk.subscriptions.list({ per: 1000 })),
-      retryWithBackoff(() => whopSdk.payments.list({ per: 1000 })),
-      retryWithBackoff(() => whopSdk.products.list({ per: 100 })),
+      retryWithBackoff(() => whopsdk.subscriptions.list({ limit: 1000 })),
+      retryWithBackoff(() => whopsdk.payments.list({ limit: 1000 })),
+      retryWithBackoff(() => whopsdk.products.list({ limit: 100 })),
     ]);
 
-    const subscriptions = subscriptionsResponse.data || [];
-    const payments = paymentsResponse.data || [];
-    const products = productsResponse.data || [];
+    const subscriptions = subscriptionsResponse?.data || [];
+    const payments = paymentsResponse?.data || [];
+    const products = productsResponse?.data || [];
 
     // Date calculations
     const now = new Date();
