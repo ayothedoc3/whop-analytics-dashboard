@@ -1,11 +1,13 @@
 import { whopsdk } from "@/lib/whop-sdk";
 import { NextResponse } from "next/server";
 
+interface PlanLike {
 type PlanLike = {
   id?: string;
   renewal_price?: number | null;
   billing_period?: number | null;
   plan_type?: string | null;
+}
 };
 
 // Helper function to calculate date ranges
@@ -65,12 +67,14 @@ const activeStatuses = new Set(["active", "trialing"]);
 
 export async function GET(): Promise<Response> {
   try {
+    const companyId = process.env.NEXT_PUBLIC_WHOP_COMPANY_ID ?? process.env.WHOP_COMPANY_ID;
     const companyId = process.env.NEXT_PUBLIC_WHOP_COMPANY_ID;
 
     if (!companyId) {
       return NextResponse.json(
         {
           error: "Missing Whop configuration",
+          message: "NEXT_PUBLIC_WHOP_COMPANY_ID or WHOP_COMPANY_ID must be set to use the analytics dashboard.",
           message: "NEXT_PUBLIC_WHOP_COMPANY_ID must be set to use the analytics dashboard.",
         },
         { status: 500 },
@@ -111,6 +115,10 @@ export async function GET(): Promise<Response> {
       const planId = membership.plan?.id;
       const fallbackPlan = membership.plan as PlanLike | null;
       const planDetails = planId ? planMap.get(planId) : undefined;
+      const plan: PlanLike = {
+        ...(fallbackPlan ?? {}),
+        ...(planDetails ?? {}),
+      };
       const plan = {
         ...(fallbackPlan ?? {}),
         ...(planDetails ?? {}),
