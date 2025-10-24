@@ -6,6 +6,9 @@ const nextConfig: NextConfig = {
   images: {
     remotePatterns: [{ hostname: "**" }],
   },
+  experimental: {
+    turbopackUseSystemTlsCerts: true,
+  },
 };
 
 export default withWhopAppConfig(nextConfig);
