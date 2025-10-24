@@ -1,6 +1,13 @@
 import { whopsdk } from "@/lib/whop-sdk";
 import { NextResponse } from "next/server";
 
+interface PlanLike {
+  id?: string;
+  renewal_price?: number | null;
+  billing_period?: number | null;
+  plan_type?: string | null;
+}
+
 // Helper function to calculate date ranges
 const getDaysAgo = (days: number): Date => {
   const date = new Date();
@@ -31,71 +38,121 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
+const parseTimestamp = (value: string | number | null | undefined): Date | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const rawNumber = typeof value === "string" && value.trim() !== ""
+    ? Number(value)
+    : typeof value === "number"
+      ? value
+      : NaN;
+
+  if (Number.isFinite(rawNumber)) {
+    const milliseconds = rawNumber > 1_000_000_000_000 ? rawNumber : rawNumber * 1000;
+    const fromNumber = new Date(milliseconds);
+    if (!Number.isNaN(fromNumber.getTime())) {
+      return fromNumber;
+    }
+  }
+
+  const fromString = new Date(value as string);
+  return Number.isNaN(fromString.getTime()) ? null : fromString;
+};
+
+const activeStatuses = new Set(["active", "trialing"]);
+
 export async function GET(): Promise<Response> {
   try {
+    const companyId = process.env.NEXT_PUBLIC_WHOP_COMPANY_ID ?? process.env.WHOP_COMPANY_ID;
+
+    if (!companyId) {
+      return NextResponse.json(
+        {
+          error: "Missing Whop configuration",
+          message: "NEXT_PUBLIC_WHOP_COMPANY_ID or WHOP_COMPANY_ID must be set to use the analytics dashboard.",
+        },
+        { status: 500 },
+      );
+    }
+
     // Fetch data from Whop API with retry logic
-    const [subscriptionsResponse, paymentsResponse, productsResponse] = await Promise.all([
-      retryWithBackoff(() => whopsdk.subscriptions.list({ limit: 1000 })),
-      retryWithBackoff(() => whopsdk.payments.list({ limit: 1000 })),
-      retryWithBackoff(() => whopsdk.products.list({ limit: 100 })),
+    const [membershipsResponse, paymentsResponse, productsResponse, plansResponse] = await Promise.all([
+      retryWithBackoff(() => whopsdk.memberships.list({ company_id: companyId, first: 1000 })),
+      retryWithBackoff(() => whopsdk.payments.list({ company_id: companyId, first: 1000 })),
+      retryWithBackoff(() => whopsdk.products.list({ company_id: companyId, first: 100 })),
+      retryWithBackoff(() => whopsdk.plans.list({ company_id: companyId, first: 200 })),
     ]);
 
-    const subscriptions = subscriptionsResponse?.data || [];
+    const memberships = membershipsResponse?.data || [];
     const payments = paymentsResponse?.data || [];
     const products = productsResponse?.data || [];
+    const plans = plansResponse?.data || [];
+
+    const planMap = new Map<string, PlanLike>();
+    plans.forEach((plan) => {
+      if (plan?.id) {
+        planMap.set(plan.id, plan as PlanLike);
+      }
+    });
 
     // Date calculations
     const now = new Date();
     const thirtyDaysAgo = getDaysAgo(30);
-    const sixtyDaysAgo = getDaysAgo(60);
     const ninetyDaysAgo = getDaysAgo(90);
 
-    // Filter active subscriptions
-    const activeSubscriptions = subscriptions.filter(
-      (sub) => sub.status === "active" || sub.status === "trialing"
-    );
+    // Filter active memberships
+    const activeMemberships = memberships.filter((membership) => activeStatuses.has(membership.status));
 
     // Calculate MRR (Monthly Recurring Revenue)
-    // Sum of all active recurring subscription prices
-    const mrr = activeSubscriptions.reduce((sum, sub) => {
-      // Handle different billing periods
-      const price = sub.plan?.renewal_price || 0;
-      const interval = sub.plan?.billing_period || "month";
+    // Sum of all active recurring membership prices
+    const mrrCents = activeMemberships.reduce((sum, membership) => {
+      const planId = membership.plan?.id;
+      const fallbackPlan = membership.plan as PlanLike | null;
+      const planDetails = planId ? planMap.get(planId) : undefined;
+      const plan: PlanLike = {
+        ...(fallbackPlan ?? {}),
+        ...(planDetails ?? {}),
+      };
 
-      // Normalize to monthly
-      let monthlyPrice = price;
-      if (interval === "year") {
-        monthlyPrice = price / 12;
-      } else if (interval === "week") {
-        monthlyPrice = price * 4.33; // Average weeks per month
-      } else if (interval === "day") {
-        monthlyPrice = price * 30;
+      if (plan.plan_type !== "renewal") {
+        return sum;
       }
+
+      const renewalPrice = plan.renewal_price ?? 0;
+      const billingPeriod = plan.billing_period && plan.billing_period > 0 ? plan.billing_period : 1;
+      const monthlyPrice = renewalPrice / billingPeriod;
 
       return sum + monthlyPrice;
     }, 0);
 
     // Calculate new subscriptions in last 30 days
-    const newSubscriptions = subscriptions.filter((sub) => {
-      const createdAt = new Date(sub.created_at);
-      return createdAt >= thirtyDaysAgo && createdAt <= now;
+    const newSubscriptions = memberships.filter((membership) => {
+      const createdAt = parseTimestamp(membership.created_at);
+      return createdAt && createdAt >= thirtyDaysAgo && createdAt <= now;
     }).length;
 
     // Calculate churn rate
     // Churn = (Cancelled subscriptions in last 30 days / Total active 30 days ago) * 100
-    const subscribersThirtyDaysAgo = subscriptions.filter((sub) => {
-      const createdAt = new Date(sub.created_at);
-      return createdAt <= thirtyDaysAgo;
+    const subscribersThirtyDaysAgo = memberships.filter((membership) => {
+      const createdAt = parseTimestamp(membership.created_at);
+      const cancelledAt = parseTimestamp(membership.canceled_at);
+
+      if (!createdAt || createdAt > thirtyDaysAgo) {
+        return false;
+      }
+
+      if (cancelledAt && cancelledAt <= thirtyDaysAgo) {
+        return false;
+      }
+
+      return true;
     }).length;
 
-    const cancelledInLast30Days = subscriptions.filter((sub) => {
-      const cancelledAt = sub.cancel_at_period_end ? new Date(sub.cancel_at_period_end) : null;
-      return (
-        cancelledAt &&
-        cancelledAt >= thirtyDaysAgo &&
-        cancelledAt <= now &&
-        (sub.status === "cancelled" || sub.status === "past_due")
-      );
+    const cancelledInLast30Days = memberships.filter((membership) => {
+      const cancelledAt = parseTimestamp(membership.canceled_at);
+      return cancelledAt && cancelledAt >= thirtyDaysAgo && cancelledAt <= now;
     }).length;
 
     const churnRate = subscribersThirtyDaysAgo > 0
@@ -104,21 +161,31 @@ export async function GET(): Promise<Response> {
 
     // Calculate revenue trend for last 90 days (grouped by day)
     const revenueTrend: { date: string; revenue: number }[] = [];
+    const revenueByDay = new Map<string, number>();
+
+    payments.forEach((payment) => {
+      const paymentDate = parseTimestamp(payment.created_at);
+      if (!paymentDate) {
+        return;
+      }
+
+      if (paymentDate < ninetyDaysAgo || paymentDate > now) {
+        return;
+      }
+
+      const dateKey = paymentDate.toISOString().split("T")[0];
+      const current = revenueByDay.get(dateKey) ?? 0;
+      const paymentTotal = payment.usd_total ?? payment.total ?? payment.subtotal ?? 0;
+      revenueByDay.set(dateKey, current + paymentTotal);
+    });
 
     for (let i = 89; i >= 0; i--) {
       const date = getDaysAgo(i);
-      const dateStr = date.toISOString().split('T')[0];
-
-      const dailyRevenue = payments
-        .filter((payment) => {
-          const paymentDate = new Date(payment.created_at);
-          return paymentDate.toISOString().split('T')[0] === dateStr;
-        })
-        .reduce((sum, payment) => sum + (payment.final_amount || 0), 0);
-
+      const dateKey = date.toISOString().split("T")[0];
+      const dailyRevenue = revenueByDay.get(dateKey) ?? 0;
       revenueTrend.push({
-        date: dateStr,
-        revenue: dailyRevenue / 100, // Convert cents to dollars
+        date: dateKey,
+        revenue: dailyRevenue / 100,
       });
     }
 
@@ -127,14 +194,15 @@ export async function GET(): Promise<Response> {
 
     payments
       .filter((payment) => {
-        const paymentDate = new Date(payment.created_at);
-        return paymentDate >= thirtyDaysAgo && paymentDate <= now;
+        const paymentDate = parseTimestamp(payment.created_at);
+        return paymentDate && paymentDate >= thirtyDaysAgo && paymentDate <= now;
       })
       .forEach((payment) => {
-        const productId = payment.product_id;
+        const productId = payment.product?.id;
         if (productId) {
           const existing = productRevenueMap.get(productId);
-          const revenue = (payment.final_amount || 0) / 100; // Convert cents to dollars
+          const paymentTotal = payment.usd_total ?? payment.total ?? payment.subtotal ?? 0;
+          const revenue = paymentTotal / 100; // Convert cents to dollars
 
           if (existing) {
             existing.revenue += revenue;
@@ -156,10 +224,10 @@ export async function GET(): Promise<Response> {
     // Return analytics data
     return NextResponse.json({
       metrics: {
-        mrr: Math.round(mrr) / 100, // Convert cents to dollars
+        mrr: Math.round(mrrCents) / 100, // Convert cents to dollars
         churnRate: Math.round(churnRate * 100) / 100, // Round to 2 decimal places
         newSubscriptions,
-        totalActiveSubscribers: activeSubscriptions.length,
+        totalActiveSubscribers: activeMemberships.length,
       },
       revenueTrend,
       topProducts,
