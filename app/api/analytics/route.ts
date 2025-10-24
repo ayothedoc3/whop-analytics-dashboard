@@ -15,6 +15,11 @@ const parseTimestamp = (value?: string | null): Date | null => {
 
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+type PlanLike = {
+  id?: string;
+  renewal_price?: number | null;
+  billing_period?: number | null;
+  plan_type?: string | null;
 };
 
 // Helper function to calculate date ranges
@@ -47,6 +52,31 @@ async function retryWithBackoff<T>(
   throw lastError;
 }
 
+const parseTimestamp = (value: string | number | null | undefined): Date | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const rawNumber = typeof value === "string" && value.trim() !== ""
+    ? Number(value)
+    : typeof value === "number"
+      ? value
+      : NaN;
+
+  if (Number.isFinite(rawNumber)) {
+    const milliseconds = rawNumber > 1_000_000_000_000 ? rawNumber : rawNumber * 1000;
+    const fromNumber = new Date(milliseconds);
+    if (!Number.isNaN(fromNumber.getTime())) {
+      return fromNumber;
+    }
+  }
+
+  const fromString = new Date(value as string);
+  return Number.isNaN(fromString.getTime()) ? null : fromString;
+};
+
+const activeStatuses = new Set(["active", "trialing"]);
+
 export async function GET(): Promise<Response> {
   try {
     const companyId = process.env.WHOP_COMPANY_ID;
@@ -57,6 +87,13 @@ export async function GET(): Promise<Response> {
         {
           error: "Failed to fetch analytics data",
           message: "Server configuration is missing WHOP_COMPANY_ID",
+    const companyId = process.env.NEXT_PUBLIC_WHOP_COMPANY_ID;
+
+    if (!companyId) {
+      return NextResponse.json(
+        {
+          error: "Missing Whop configuration",
+          message: "NEXT_PUBLIC_WHOP_COMPANY_ID must be set to use the analytics dashboard.",
         },
         { status: 500 },
       );
@@ -70,6 +107,9 @@ export async function GET(): Promise<Response> {
       retryWithBackoff(() => whopsdk.payments.list({ first: 1000 })),
       retryWithBackoff(() => whopsdk.products.list({ company_id: companyId, first: 100 })),
       retryWithBackoff(() => whopsdk.plans.list({ company_id: companyId, first: 1000 })),
+      retryWithBackoff(() => whopsdk.payments.list({ company_id: companyId, first: 1000 })),
+      retryWithBackoff(() => whopsdk.products.list({ company_id: companyId, first: 100 })),
+      retryWithBackoff(() => whopsdk.plans.list({ company_id: companyId, first: 200 })),
     ]);
 
     const memberships = membershipsResponse?.data || [];
@@ -87,6 +127,12 @@ export async function GET(): Promise<Response> {
         },
       ]),
     );
+    const planMap = new Map<string, PlanLike>();
+    plans.forEach((plan) => {
+      if (plan?.id) {
+        planMap.set(plan.id, plan as PlanLike);
+      }
+    });
 
     // Date calculations
     const now = new Date();
@@ -96,6 +142,10 @@ export async function GET(): Promise<Response> {
     const activeMemberships = memberships.filter(
       (membership) => membership.status === "active" || membership.status === "trialing",
     );
+    const ninetyDaysAgo = getDaysAgo(90);
+
+    // Filter active memberships
+    const activeMemberships = memberships.filter((membership) => activeStatuses.has(membership.status));
 
     const getCycleLengthInDays = (membership: (typeof memberships)[number]): number | null => {
       const start = parseTimestamp(membership.renewal_period_start);
@@ -135,6 +185,23 @@ export async function GET(): Promise<Response> {
 
       const cycleDays = getCycleLengthInDays(membership) ?? 30;
       const monthlyPrice = cycleDays > 0 ? renewalPrice * (30 / cycleDays) : renewalPrice;
+    // Sum of all active recurring membership prices
+    const mrrCents = activeMemberships.reduce((sum, membership) => {
+      const planId = membership.plan?.id;
+      const fallbackPlan = membership.plan as PlanLike | null;
+      const planDetails = planId ? planMap.get(planId) : undefined;
+      const plan = {
+        ...(fallbackPlan ?? {}),
+        ...(planDetails ?? {}),
+      } satisfies PlanLike;
+
+      if (plan.plan_type !== "renewal") {
+        return sum;
+      }
+
+      const renewalPrice = plan.renewal_price ?? 0;
+      const billingPeriod = plan.billing_period && plan.billing_period > 0 ? plan.billing_period : 1;
+      const monthlyPrice = renewalPrice / billingPeriod;
 
       return sum + monthlyPrice;
     }, 0);
@@ -146,6 +213,7 @@ export async function GET(): Promise<Response> {
         return false;
       }
       return createdAt >= thirtyDaysAgo && createdAt <= now;
+      return createdAt && createdAt >= thirtyDaysAgo && createdAt <= now;
     }).length;
 
     // Calculate churn rate
@@ -156,6 +224,17 @@ export async function GET(): Promise<Response> {
         return false;
       }
       return createdAt <= thirtyDaysAgo;
+      const cancelledAt = parseTimestamp(membership.canceled_at);
+
+      if (!createdAt || createdAt > thirtyDaysAgo) {
+        return false;
+      }
+
+      if (cancelledAt && cancelledAt <= thirtyDaysAgo) {
+        return false;
+      }
+
+      return true;
     }).length;
 
     const cancelledInLast30Days = memberships.filter((membership) => {
@@ -166,6 +245,7 @@ export async function GET(): Promise<Response> {
         cancelledAt <= now &&
         (membership.status === "canceled" || membership.status === "past_due")
       );
+      return cancelledAt && cancelledAt >= thirtyDaysAgo && cancelledAt <= now;
     }).length;
 
     const churnRate = subscribersThirtyDaysAgo > 0
@@ -174,10 +254,17 @@ export async function GET(): Promise<Response> {
 
     // Calculate revenue trend for last 90 days (grouped by day)
     const revenueTrend: { date: string; revenue: number }[] = [];
+    const revenueByDay = new Map<string, number>();
 
-    for (let i = 89; i >= 0; i--) {
-      const date = getDaysAgo(i);
-      const dateStr = date.toISOString().split('T')[0];
+    payments.forEach((payment) => {
+      const paymentDate = parseTimestamp(payment.created_at);
+      if (!paymentDate) {
+        return;
+      }
+
+      if (paymentDate < ninetyDaysAgo || paymentDate > now) {
+        return;
+      }
 
       const dailyRevenue = payments
         .filter((payment) => {
@@ -188,10 +275,19 @@ export async function GET(): Promise<Response> {
           const total = Number(payment.total ?? payment.usd_total ?? 0);
           return sum + total;
         }, 0);
+      const dateKey = paymentDate.toISOString().split("T")[0];
+      const current = revenueByDay.get(dateKey) ?? 0;
+      const paymentTotal = payment.usd_total ?? payment.total ?? payment.subtotal ?? 0;
+      revenueByDay.set(dateKey, current + paymentTotal);
+    });
 
+    for (let i = 89; i >= 0; i--) {
+      const date = getDaysAgo(i);
+      const dateKey = date.toISOString().split("T")[0];
+      const dailyRevenue = revenueByDay.get(dateKey) ?? 0;
       revenueTrend.push({
-        date: dateStr,
-        revenue: dailyRevenue / 100, // Convert cents to dollars
+        date: dateKey,
+        revenue: dailyRevenue / 100,
       });
     }
 
@@ -207,6 +303,21 @@ export async function GET(): Promise<Response> {
         const productId = payment.product?.id ?? null;
         if (!productId) {
           return;
+        const productId = payment.product?.id;
+        if (productId) {
+          const existing = productRevenueMap.get(productId);
+          const paymentTotal = payment.usd_total ?? payment.total ?? payment.subtotal ?? 0;
+          const revenue = paymentTotal / 100; // Convert cents to dollars
+
+          if (existing) {
+            existing.revenue += revenue;
+          } else {
+            const product = products.find((p) => p.id === productId);
+            productRevenueMap.set(productId, {
+              name: product?.title || `Product ${productId}`,
+              revenue: revenue,
+            });
+          }
         }
 
         const revenueCents = Number(payment.total ?? payment.usd_total ?? 0);
@@ -233,7 +344,7 @@ export async function GET(): Promise<Response> {
     // Return analytics data
     return NextResponse.json({
       metrics: {
-        mrr: Math.round(mrr) / 100, // Convert cents to dollars
+        mrr: Math.round(mrrCents) / 100, // Convert cents to dollars
         churnRate: Math.round(churnRate * 100) / 100, // Round to 2 decimal places
         newSubscriptions,
         totalActiveSubscribers: activeMemberships.length,
